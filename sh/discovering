@@ -1,0 +1,45 @@
+#!/bin/sh -e
+
+API="http://ya-hw-cert.yandex-team.ru/cgi-bin/hirt.pl"
+
+ACTIVE_NIC=eth0
+
+HOSTNAME=$(cat /etc/hostname)
+
+for i in $(ls -1 /sys/class/net/|grep -v lo); do
+	t=0
+	while [ "$t" -lt "3" ]; do
+		if [ "$(cat /sys/class/net/$i/carrier 2>/dev/null)" = "1" ]; then
+			ACTIVE_NIC=$i
+			NIC_IP="$(ifconfig $i | sed -n 's/.*inet addr:\([0-9]*\.[0-9]*\.[0-9]*\.[0-9]*\).*/\1/p')"
+			NIC_MAC="$(ifconfig $i | grep -o -E '([[:xdigit:]]{1,2}:){5}[[:xdigit:]]{1,2}')"
+			break
+		fi
+		sleep 1
+		t=$((t + 1))
+	done
+done
+
+IPMI_LANCHAN="$(ipmitool channel info 2 2>&1 | fgrep -q '802.3 LAN' && echo 2 || \
+	{ ipmitool channel info 1 1>/dev/null 2>&1 && echo 1; } ||:)"
+
+BMC_MAC="$(ipmitool lan print 2>/dev/null|sed -n 's/.*MAC Address.*: \(.*\)/\1/p')"
+BMC_IP="$(ipmitool lan print 2>/dev/null|sed -n 's/.*IP Address.*:[ ]\([0-9]*\.[0-9]*\.[0-9]*\.[0-9]*\).*/\1/p')"
+
+M_BOARD="$(dmidecode -s baseboard-product-name| sed 's/[ ]*$//; s/[ /]/_/g; s/[().]\+//g')"
+CPU="$(cat /proc/cpuinfo|sort|uniq|sed -ne 's/.*model name.*:.*\(Intel\|AMD\).*\([A-Z][0-9]\{4\}\|[0-9]\{4\}\).*/\1_\2/p')"
+PCI="$(lspci|sed -n 's/.*\(LSI\|Adaptec\).*\(SAS\)[ ]*\([0-9]*\) .*/\1_\2\3/p')"
+
+BIOS_VER="$(dmidecode -s bios-version | sed 's,[ ]*$,,; s, ,_,g')"
+BMC_VER="$(ipmitool mc info 2>/dev/null | sed -n 's,^Firmware Revision[[:space:]]\+: \([0-9]\+\)\.\([0-9]\+\),\1 \2,p' | xargs -r printf '%d%02d\n')"
+
+i=0
+while [ "$BMC_IP_ADDR" = "0.0.0.0" -a $i -lt 3 ]; do
+	ipmitool lan set $IPMI_LANCHAN ipsrc dhcp || { printf "Failed to assign DHCP IP get method\!\n"; exit 1; }
+	sleep 10
+	BMC_IP_ADDR="$(ipmitool lan print 2>/dev/null|sed -n 's/.*IP[ ]Address.*:[ ]\([0-9]*\.[0-9]*\.[0-9]*\.[0-9]*\).*/\1/p')"
+	i=$(($i+1))
+done
+
+printf "$(curl "$API?hostname=$HOSTNAME&NIC_MAC=$NIC_MAC&BMC_MAC=$BMC_MAC&NIC_IP=$NIC_IP&BMC_IP=$BMC_IP&CPU=$CPU&M_BOARD=$M_BOARD&PCI=$PCI&BIOS_VER=$BIOS_VER&BMC_VER=$BMC_VER")" > /tmp/SRV_ID || \
+	i-status 1 "Can't send current state to ya-hw-test!"

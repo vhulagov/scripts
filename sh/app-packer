@@ -1,0 +1,99 @@
+#!/bin/sh -ex
+
+TEMP=`getopt -o a:b:l:f:pc --long app:,binary-place:,additional-lib:,packlist-file:,pack,assign -n "app-packer" -- "$@" || exit 0 1>&2`
+
+eval set -- "$TEMP"
+
+while :; do
+    case "$1" in
+    -a|--app) shift
+				APP="$(which $1)"
+        ;;
+    -b|--binary-place) shift
+				OPT_APP_PATH="$1"
+        ;;
+    -l|--additional-lib) shift
+        ADD_LIB="$1"
+        ;;
+    -f|--packlist-file) shift
+        PACKLIST_FILE="$1"
+        ;;
+    -p|--pack)
+        PACK='1'
+        ;;
+    -c|--create-packlist)
+        CREATE_PACKLIST='1'
+        ;;
+    --) shift
+        break
+        ;;
+    *) printf "Wrong option: $1"
+        exit 1
+        ;;
+    esac
+    shift
+done
+
+
+CRIT_LIBS='libc.so.*'
+
+APP_NAME="$(basename $APP)"
+
+[ -n "$CREATE_PACKLIST" -a -e "./$APP_NAME.packlist" ] && rm $APP_NAME.packlist
+
+if [ -n "$APP" ]; then
+	APP_BIN="$(basename $APP)"
+	APP_FULL_PATH="$(readlink -f $APP)"
+	[ -n "$OPT_APP_PATH" ] && APP_PATH=$OPT_APP_PATH || APP_PATH="$(dirname $APP_FULL_PATH)"
+
+	if [ -n "$ADD_LIB" ]; then
+		grep -R "$ADD_LIB" $APP_BIN.packlist || { \
+			echo "$ADD_LIB" >> $APP_BIN.packlist; \
+			cp "$ADD_LIB" ."$ADD_lib"; \
+			}
+	fi
+	mkdir -p .$APP_BIN/$APP_PATH
+#TODO Clarify the PATHes
+	cp -pP $APP .$APP_BIN/$APP_PATH/ ||:
+	if [ -n "$CREATE_PACKLIST" ]; then
+		#TODO: Make basis path, example /usr for /usr/local/bin/fio
+		printf "$(find $(dirname .$APP|sed -ne 's,\(.*\)\/.*,\1,p') -type d)\n" > $APP_BIN.packlist
+		#printf "$(find $(dirname .$APP_PATH|sed -ne 's,\./\(.*\)/.*,\1,p'|sed -n 's/^/\.\//p') -type d)\n" > $APP.packlist
+		printf ".$(ls -dU $APP)\n" >> $APP_BIN.packlist
+	fi
+
+
+	#FILES=$(ldd $APP|sed -ne 's/.*> \(.*\) .*/\1/p'|sed "/^\[s*$|$CRIT_LIBS/d"|sort -uz)
+	[ -n "$PACKLIST_FILE" ] && FILES=$(cat $PACKLIST_FILE) || FILES=$(ldd $APP|sed -ne 's/.*> \(.*\) .*/\1/p'|sed "/$CRIT_LIBS/d"|sort -uz)
+	for P in $FILES; do
+		[ -f "$P" ] && FILE_DIR=$(dirname $P) || FILE_DIR=$P
+		mkdir -p .$FILE_DIR
+		cp -pP $P .$FILE_DIR/ ||:
+		if [ -h $P ]; then
+			FILE=$(readlink $P)
+			cp -pP $FILE_DIR/$FILE .$FILE_DIR/ ||:
+			[ -n "$CREATE_PACKLIST" ] && printf ".$FILE_DIR/$FILE\n" >> $APP_BIN.packlist
+		fi
+		[ -n "$CREATE_PACKLIST" ] && printf ".$P\n" >> $APP_BIN.packlist
+	done
+fi
+
+# BUG
+	for P in $FILES; do
+		[ -f "$P" ] && FILE_DIR=$(dirname $P) || FILE_DIR=$P
+		mkdir -p $FILE_DIR
+		cp -pP $(printf $P | sed 's/^.//') ./$FILE_DIR/ ||:
+		if [ -h $P ]; then
+			FILE=$(readlink $P)
+			cp -pP $FILE_DIR/$FILE .$FILE_DIR/
+			[ -n "$CREATE_PACKLIST" ] && printf ".$FILE_DIR/$FILE\n" >> $APP_BIN.packlist
+		fi
+		[ -n "$CREATE_PACKLIST" ] && printf ".$P\n" >> $APP_BIN.packlist
+	done
+
+	[ -n "$PACK" ] && ls -dU $(cat $APP_BIN.packlist) | cpio -o -H newc | lzma -9 -c > $APP_BIN.cpio
+
+if [ -n "$PACKLIST_FILE" -a -n "$PACK" ]; then
+	APP=$(basename "$PACKLIST_FILE" | sed -n 's/.*\.\([a-z]*\)/\1/p');
+	ls -dU `printf "$FILES" | sed 's,^/,./,'` | cpio -o -H newc | lzma -9 -c > contents.$APP.cpio
+fi
