@@ -1,8 +1,10 @@
 #!/bin/sh -e
-# VERSION: 0.3
+VERSION=0.6
 
-g-unpack-cpio t:mem
-g-unpack-cpio t:hdd
+cd /
+cat t:mem | lzma -c -d | cpio -iumd
+cat t:hdd | lzma -c -d | cpio -iumd
+
 
 export PATH="$PATH:/usr/local/bin"
 
@@ -34,40 +36,51 @@ trap storage_test_sigstop USR1 KILL TERM EXIT QUIT INT
 usage()
 {
 cat - >&2 <<EOF
--f|--functional-test; Select test type: bad-bloks for search all devices for bad blocks; fio for check I/O problems on HBA/DAS.
+-a|--functional-test; Select test type: bad-bloks for search all devices for bad blocks; fio for check I/O problems on HBA/DAS.
 -D|--device-list FIO parameter; Set types of configurations in which disk system will be configured; May be disk; raid0; raid6, etc. When disk storage consist of more than 24 HDD, disks groups by 20 HDD per raid.
 -M|--method-list  FIO parameter; Set type(method) of disks operations, there are: random, sequential
 -m|--mode-list   FIO parameter; Set mode of work with storage, there are: read, write, readwrite
 -d|--io-depth   FIO parameter; Depth of I/O operations;
--t|--test-opt_test_duration   FIO parameter; Duration of the test in seconds;
+-t|--test-duration   FIO parameter; Duration of the test in seconds;
 -n|--disks-num   Right number of disks in storage;
 -h|--max-hdd-temp  Set the value of maximum temperature of disks trigger;
 -l|--max-latency  Set the value of maximum latency in disks operations, microseconds;
 -I|--min-iops  Set the value of minimum IOPS in disks operations, trigger;
 -b|--min-bandwidth  Set the value of minimum bandwidth in disks operations, KB/s;
--a|--all-disks !!!DANGEROUS!!! Run
+-A|--all-disks !!!DANGEROUS!!! Run test on all disks (include system);
+-F|--flush-storage !!!DANGEROUS!!! Erease storage configuration.
 EOF
   exit 1
 }
 
 
-API_URL="http://ya-hw-cert.yandex-team.ru/cgi-bin/storage_testormance.pl"
+API_URL=""
 logfile=/var/log/storage-test.$$
 tmp_dir=/tmp/storage-test.$$
+bad_disks_list=$tmp_dir/bad-disks-list
 bad_block_list=$tmp_dir/bad-block-list
-bad_smart_list=$tmp_dir/bad-smart-list
 ipid_file=/var/run/inotifywait.pid
+jpid_file=/var/run/fio-jobs.pid
 fpid_file=/var/run/storage-test.pid
 tpid_file=/var/run/temp-hdd-check.pid
 srv_id=$(cat /tmp/srv_id 2>/dev/null ||:)
 
-TEMP=`getopt -o f:D:h:M:m:d:t:n:l:I:b:aF --long apply-tyst:,device-list:,max-hdd-temp:,method-list:,mode-list:,io-depth:,test-opt_test_duration:,disks-num:,max-latency:,min-iops:,min-bandwidth:,all-disks,flush-storage -n "t:storage" -- "$@" || i-fail "t:storage: Wrong parameters"`
+TEMP=`getopt -o a:D:h:M:m:d:t:n:l:I:b:AF --long apply-test:,device-list:,max-hdd-temp:,method-list:,mode-list:,io-depth:,test-duration:,disks-num:,max-latency:,min-iops:,min-bandwidth:,all-disks,flush-storage -n "t:storage" -- "$@" || echo  "t:storage: Wrong parameters"`
 
 eval set -- "$TEMP"
 
 bad_blocks_check=1
 device_list=disk
+method_list=seq
+mode_list='read,write'
 all_disks_flag=1
+
+# Num of similtuosly disk tests
+dev_group_dim_seq=4
+dev_group_dim_rand=10
+
+stor_test_time=120
+sys_test_time=300
 
 # Defait FIO configuration
 block_size=8k
@@ -77,32 +90,49 @@ io_engine=libaio
 
 io_seq_depth=1
 io_ran_depth=16
-opt_test_duration=1800
+test_duration=360
 
 # Critical SMART parameters
 max_pend=10    # Maximum Pending sectors
 max_offunc=10  # Maximum Offline UNC errors
 max_revent=10  # Maximim Realloceted events
-max_rsect=3    # Maximim Reallocated sectors (Bad blocks)
+max_hdd_rsect=3    # Maximim Reallocated sectors (Bad blocks) for HDD
+max_ssd_rsect=20    # Maximim Reallocated sectors (Bad blocks) for SSD
 max_read_err=1 # Maximum Rear Raw errors (for WD and Hitachi only)
 
+
+# Critical preformance constants
 max_hdd_temp=55
 warn_hdd_temp=50
 
+# Critical FIO parameters
+# for single disk
 ref_stor_disks_num=15
 
-# Critical FIO parameters
-ref_iops=500
-ref_latency=100000
-ref_bandwidth=5000
+ref_iops_rand_single=50
+ref_latency_rand_read_single=20000
+ref_latency_rand_write_single=20000
+ref_bandwidth_seq_single=100000
+
+# for system disks only
+ref_iops_sys=50
+ref_latency_read_sys=185000
+ref_latency_write_sys=10000
+ref_bandwidth_sys=350000
+
+# for summary
+ref_iops_all=50
+ref_latency_read_all=100000
+ref_latency_write_all=10000
+ref_bandwidth_all=5000
 
 
 while :; do
     case "$1" in
-		-f|--apply-test) shift
+		-a|--apply-test) shift
 				case "$1" in
 				fio|badblocks) ;;
-				*) i-fail "t:storage: unknown test: $1" ;;
+				*) echo  "t:storage: unknown test: $1" ;;
 				esac
 				opt_tests="${opt_tests:+$opt_tests,}$1"
 				;;
@@ -113,16 +143,22 @@ while :; do
 				max_hdd_temp=$1
 				;;
 		-M|--method-list) shift
-				method_list=$1
+        case "$1" in
+        rand|seq) method_list=$1 ;;
+        *) echo  "t:storage: unknown method: $1" ;;
+				esac
 				;;
 		-m|--mode-list) shift
-				mode_list=$1
+        case "$1" in
+        read|write|readwrite|read,write) mode_list=$1 ;;
+        *) echo  "t:storage: unknown method: $1" ;;
+				esac
 				;;
 		-d|--io-depth) shift
 				io_seq_depth=$1
 				io_ran_depth=$1
 				;;
-		-t|--test-opt_test_duration) shift
+		-t|--test-duration) shift
 				opt_test_duration=$1
 				;;
 		-n|--disks-num) shift
@@ -137,7 +173,7 @@ while :; do
 		-b|--min-bandwidth) shift
 				ref_bandwidth=$1
 				;;
-		-a|--all-disks)
+		-A|--all-disks)
 				all_disks_flag=1
 				;;
 		-F|--flush-storage)
@@ -146,14 +182,17 @@ while :; do
     --) shift
         break
         ;;
-		*) i-fail "t:storage: Unimplemented option chosen: $1"
+		*) echo  "t:storage: Unimplemented option chosen: $1"
         ;;
 		esac
 		shift
 done
 
 [ -n "$opt_tests" ] || opt_tests=fio
-opt_tests="$(echo $opt_tests | tr ',' ' ')"
+[ -z "$opt_test_duration" ] || test_duration=$opt_test_duration
+opt_tests="$(printf $opt_tests | tr ',' ' ')"
+mode_list="$(printf $mode_list | tr ',' ' ')"
+method_list="$(printf $method_list | tr ',' ' ')"
 
 mkdir -p $tmp_dir
 
@@ -162,15 +201,14 @@ stor_disks=$(lsscsi -tg | grep sas | sed -n 's,.*\(/dev/sd[a-z]*\) .*,\1,p')
 sys_disks=$(lsscsi | grep -vE 'sas|AMI|cd' | sed -n 's,.*\(/dev/sd[a-z]\).*,\1,p')
 [ -n "$sys_disks" ] && sys_disks_num=$(printf "$sys_disks\n" | wc -l)
 
-[ ! -n "$stor_disks" -a ! -n "$sys_disks" ] && i-log log "t:storage: WARNING! No disks found at all"
+[ ! -n "$stor_disks" -a ! -n "$sys_disks" ] && echo "t:storage: WARNING! No disks found at all"
 
 [ -n "$all_disks_flag" ] && test_disk_list="$(printf "$sys_disks\n$stor_disks")" || test_disk_list="$stor_disks"
 [ -n "$all_disks_flag" ] && test_disk_list_num="$(($stor_disks_num+$sys_disks_num))" || test_disk_list_num="$stor_disks_num"
 
 expanders=$(sg_map -x | awk '{if ( $6 == 13 ) { print $1 }}'| tr '\n' ' ')
-[ -n "$expanders" ] || i-log log "t:storage: Disks expander(s) not found"
-#[ -n "$expander" ] || { i-log log "t:storage: Disks expander not found"; \
-#		 test_disk_list="$sys_disks"; test_disk_list_num=$sys_disks_num; }
+[ -z "$expanders" ] && echo "t:storage: Disks expander(s) not found"
+[ -n "$expanders" -a -z "$stor_disks" ] && echo "t:storage: Disks expander(s) found but no disks in storage"
 
 flush_storage_configuration()
 {
@@ -210,12 +248,12 @@ case "$1" in
 esac
 
 eval `get_slot $2`
-sg_ses --index="$slot" --set=$sg_str=1 "$expander" ||: 
+sg_ses --index="$slot" --set=$sg_str=1 "$expander" 2>/dev/null ||: 
 }
 
 [ -n "$flush_storage_conf_flag" ] && flush_storage_configuration
 
-light_down_slots
+[ -z "$expanders" ] || light_down_slots
 
 check_drive_type()
 {
@@ -226,73 +264,18 @@ check_drive_type()
 	fi
 }
 
-
-check_smart()
-{
-	for d in $test_disk_list; do
-		eval `check_drive_type ${d#/dev/}`
-		case $drive_type in 
-			sata-hdd)			
-			eval `timeout 10 smartctl -A -H -i -a $d | fgrep -v '===' | sed '/Warning/d' | awk '
-			/Device Model/{ model=$3$4 }
-			/Power_On_Hours/{ poh=$10 }
-			/Serial [Nn]umber:/ { drive_ser_num=$3 }
-			/Raw_Read_Error_Rate/{ read_error=$10}
-			/Reported_Uncorrect/ { runc=$10 }
-			/Current_Pending_Sector/ { pend=$10 }
-			/Offline_Uncorrectable/ { offunc=$10 }
-			/Reallocated_Sector_Ct/ { rsec=$10 }
-			/Reallocated_Event_Count/ { revent=$10 }
-			/SMART overall-health/ { health=$6 }
-			/ATA Error/{ ata_err=$4 }
-			END {
-				print  "drive_ser_num=" drive_ser_num "; model=" model ";  poh=" poh "; runc=" runc "; pend=" pend "; offunc=" offunc ";" 
-				print "read_error=" read_error "; ata_err=" ata_err "; rsec=" rsec "; revent=" revent "; health=\"" health "\";"
-			}' | sed 's/,//g' 2>/dev/null`
-
-			wd=$(printf "$model" | grep WDC ||:) 
-			hitachi=$(printf "$model" | grep -i Hitachi ||:)
-
-			#data=$(echo "MODEL="$model"&SERIAL_NUM="$drive_ser_num"&POH="$poh"&READ_ERROR_RATE="$read_error"&CURRENT_PEND=""$pend""&REALLOC=""$rsec""&OFFLINE_UNC=""$offunc""&REALL_EVENT=""$revent""&HEALTH="$health"&ATA_ERROR="$ata_err)
-			what=''
-
-				[ ${rsec:-0} -gt $max_rsect ] && what="Reallocated_Sector_Ct: $rsec"
-				[ ${pend:-0} -gt $max_pend ] && what="Current_Pending_Sector: $pend"
-				[ ${offunc:-0} -gt $max_offunc ] && what="Offline_Uncorrectable: $rsec"
-				[ ${revent:-0} -gt $max_revent ] && what="Reallocated_Event_Count: $revent"
-				[ ${health:-0} != "PASSED" ] && what="overall-health: $health"
-				[ -n "$ata_err" ] && what="ATA Error: $ata_err"
-				if [ -z $model -a -z $drive_ser_num ]; then
-					if [ -n "$wd" -a ${read_error:-0} -gt $max_read_err ] || 2>&1\
-						[ -n "$hitachi" -a ${read_error:-0} -gt $max_read_err ]; then
-							#[ -n "$send_results" ] && curl -v -g -d "STAGE=1&RESULT=FAILED&REASON=SMART_FAILED&$data" "$api_url"
-							what="Raw_Read_Error_Rate > 1 on $model: $read_error"
-					fi
-				fi
-				[ -n "$what" ] && { i-log log "t:storage: $d(S/N:$drive_ser_num) - bad SMART, $what" 2>&1 | tee -a $bad_smart_list; light_up_slot failed $d || rc=$?; }
-			;;
-			ssd) ;;
-			sas) ;;
-		esac
-		smart_warning_messages=$(timeout 10 smartctl -A -H -i -a $d | grep Warning)
-		[ -n "$smart_warning_messages" ] && echo "t:storage: $(timeout 10 smartctl -A -H -i -a $d | grep Warning)" 
-	done
-
-	[ ! -s "$bad_smart_list" ] || { i-log log "t:storage: $(cat $bad_smart_list | cut -d ' ' -f 3- | tr '\n' ';')"; return 1; }
-}
-
-
 check_log()
 {
 	inotifywait -q -m -e modify /var/log/messages | while read foo; do
 		if grep -E -q "(mpt2sas.*removing handle.*|mpt2sas.*log_info\(0x[0-9A-F]*\)|end_request: I/O error, dev sd)" /var/log/messages; then
 			disk_err="$(cat /var/log/messages | cut -d ']' -f2- | sort -u | sed -n 's/.*end_request: I\/O error, dev \(sd[a-z]*\),.*/\1/p')"
+			
 			[ -n "$expanders" ] && phy_err="$(cat /var/log/messages | cut -d ']' -f2- | sort -u | sed -n 's,.*mpt2sas.*log_info(\(0x[0-9A-F]*\)).*code(\(0x[0-9A-F]*\)).*sub_code(\(0x[0-9A-F]*\)).*,\1\,\2\,\3\n,p')"
 			[ -n "$expanders" ] && disk_missing_err="$(cat /var/log/messages | cut -d ']' -f2- | sort -u | sed -n 's,.*mpt2sas.*removing handle.*sas_addr(\(0x[0-9A-F]*\)).*,\1,p')"
 			[ -n "$disk_missing_err" ] && disk_missing=$(check_empty_slots | grep -v "$empty_slots")
-			[ -n "$disk_missing" ] && i-log log "t:storage: Disk fires back during test in slot: $disk_missing" 2>&1 | tee -a $logfile
-			[ -n "$disk_err" -a -z "$phy_err" ] && i-log log "t-storage: I/O errors on $disk_err" 2>&1 | tee -a $logfile
-			[ -n "$disk_err" -a -n "$phy_err" ] &&  i-log log "t-storage: Errors on physical layer of $disk_err; log_info,code,sub_code: $phy_err" 2>&1 | tee -a $logfile
+			[ -n "$disk_missing" ] && echo "t:storage: Disk fires back during test in slot: $disk_missing" 2>&1 | tee -a $logfile
+			[ -n "$disk_err" -a -z "$phy_err" ] && echo "t-storage: I/O errors on $disk_err" 2>&1 | tee -a $logfile
+			[ -n "$disk_err" -a -n "$phy_err" ] &&  echo "t-storage: Errors on physical layer of $disk_err; log_info,code,sub_code: $phy_err" 2>&1 | tee -a $logfile
 		else
 			continue
 		fi
@@ -304,8 +287,8 @@ check_empty_slots()
 	if [ -n "$expanders" ]; then 
 		for e in $expanders; do
 #TODO Prepare parameters and values to better usage in check_storage_disks_num
-			empty_slots="$(sg_ses -p 0xA $e | grep 0x0000000000000000 -B 8 | sed -n 's/.*Element index: \([0-9]\)/\1/p')"
-			#empty_slots="$(sg_ses -p 0xA $expander | grep 0x0000000000000000 -B 8 | awk '/Element index/{print $3}'|tr '\012' ', ' )"; 
+			#empty_slots="$(sg_ses -p 0xA $e | grep 0x0000000000000000 -B 8 | sed -n 's/.*Element index: \([0-9]\)/\1/p;s/\n' | tr '\n' ',' | sed 's/\,$//g' )"
+			empty_slots="$(sg_ses -p 0xA $e | grep 0x0000000000000000 -B 8 | sed -n 's/.*Element index: \([0-9]\)/\1/p' | tr '\n' ',' | sed 's/\,$//g')"
 		done
 		printf "$empty_slots\n"
 	fi
@@ -313,83 +296,189 @@ check_empty_slots()
 
 check_storage_disks_num()
 {
-	[ "$stor_disks_num" -eq "$ref_stor_disks_num" ] || { 
-		i-log log "t:storage: Number of disks in storage is $stor_disks_num, that is less than $ref_stor_disks_num. Empty slots: $(check_empty_slots)" 2>&1 | tee -a $logfile; }
+	if [ -n "$stor_disks_num" ]; then 
+		[ "$stor_disks_num" -eq "$ref_stor_disks_num" ] || { 
+			echo "t:storage: Number of disks in storage is $stor_disks_num, that is less than $ref_stor_disks_num. Empty slots: $(check_empty_slots)" 2>&1 | tee -a $logfile; }
+	else
+
+		for i in $(seq 0 10); do
+			if $(h-lsdev | grep -q /dev/ses$i); then
+				dev=$(h-lsdev | grep /dev/ses$i | cut -f 1 -d ' ')
+				num=$(for i in `seq 1 128`; do
+					if sg_ses -I $i $dev | grep -q ">>> no match on"; then
+						echo $i
+						break
+					fi
+				done
+				);
+
+				for j in `seq  1 $num`; do
+					if ! h-lsdev | grep -q /dev/das:$i:$j; then
+						echo -n "$i:$(expr $j - 1) "
+						sg_ses -I $(expr $j - 1) -S fault $dev
+					fi
+				done
+			fi
+		done
+
+	fi
 }
 
 send_results()
 {
-	RESULTS="&IOPS_"$DEVICE"_"$METHOD"_"$MODE"="$IOPS"&latency_"$DEVICE"_"$METHOD"_"$MODE"="$LATENCY"&bandwidth_"$DEVICE"_"$METHOD"_"$MODE"="$BANDWIDTH
-	curl "$API_URL?srv_id=$srv_id$RESULTS" || i-log log "Can't send current state to ya-hw-test!"
+	RESULTS="&IOPS_${device}_${method}_${mode}=${IOPS}&latency_${device}_${method}_${mode}=${latency}&bandwidth_${device}_${method}_${mode}=${bandwidth}"
+	curl "$API_URL?srv_id=$srv_id$RESULTS" || echo "Can't send current state to ya-hw-test!"
 }
 
+#TODO
+#human_readable_format()
+#{
+#	if [ "$1" -ge 60 -a "$1" -lt 3600 ]; then
+#		printf "$(($1/60))h"
+#	ifelse 
+#		[ "$1" -ge 3600 ] && printf "$(($1/3600))h"
+#	else
+#		printf "$1s"
+#	fi
+#}
+
+run_fio_job()
+{
+									fio $conf_file  > $log_file || { rc=$?; echo  "t:storage: Failed to start fio"; }
+									check_fio_results ${dev_disk#/dev/} ${log_file} || rc=$?
+}
+									
 run_fio()
 {
-	for DEVICE in $device_list; do
-		for METHOD in $method_list; do
-			for MODE in $mode_list; do
-				MODE_NAME=$METHOD""$MODE
-				[ "$METHOD" = "rand" ] && IO_DEPTH=$io_ran_depth || { IO_DEPTH=$io_seq_depth; MODE_NAME=$MODE; }
+if [ -n "$stor_disks" -a "$device_list" = "disk" ]; then
+	mode_multiplier=$(printf "mode_list" | wc -w)
+	method_multiplier=$(printf "method_list" | wc -w)
+	test_duration=$(($stor_disks_num*$stor_test_time${mode_multiplier:+*$mode_multiplier}${method_multiplier:+*$method_multiplier} + $sys_disks_num*$sys_test_time${mode_multiplier:+*$mode_multiplier}${method_multiplier:+*$method_multiplier}))
+else
+	test_duration=$(($sys_disks_num*$sys_test_time${mode_multiplier:+*$mode_multiplier}${method_multiplier:+*$method_multiplier}))
+fi
 
-				conf_file=$tmp_dir/$METHOD"_"$MODE"_"$DEVICE.conf
-				log_file=$tmp_dir/$METHOD"_"$MODE"_"$DEVICE.log
+# TODO: Human readable format (see upper function)
+echo "t:storage: Expected duration of the test is ${test_duration}s"
 
-				FILENAMES=''
-				if [ -n "$(printf "$DEVICE" | sed -n '/^raid/p')" ]; then
-					RAID_DEV=/dev/md0
-					RAID_LEVEL="$(printf $DEVICE | sed -n 's/^[a-z]*\([0-9]*\)/\1/p')"
+	for device in $device_list; do
+		for method in $method_list; do
+			for mode in $mode_list; do
+				mode_name="${method}${mode}"
 
-					if [ "$stor_disks_num" -gt 24 ]; then
-					DISKS_FROM=1
-					[ -n "RAID_DEV_NUM" ] || RAID_DEV_NUM=20
-					RAID_DEVS=''
-						for G in `seq $(($stor_disks_num/$RAID_DEV_NUM))`; do
-							RAID_DEV="/dev/md$(($G-1))"
-							DISKS_TO=$(($G*$RAID_DEV_NUM+1))
-							DISKS_PART=$(lsscsi -tg | grep sas | sed -n '$DISKS_FROM,$DISKS_TO{s,.*\(/dev/sd[a-z]*\),\1,p}' | tr '\012' ' ')
-							DISKS_FROM=$(($DISKS_TO+1));
-							mdadm --create $RAID_DEV --level=$RAID_LEVEL --raid-devices=$RAID_DEV_NUM "$DISKS_PART"
-							RAID_DEVS="$([ -n "$RAID_DEVS" ] && printf "$RAID_DEVS ")$RAID_DEV"
-							FILENAMES=$(printf "$FILENAMES\nfilename=$RAID_DEV")
-						done
-						mdadm -W $RAID_DEVS
-					else
-						RAID_DEVS=$RAID_DEV
-						mdadm --create $RAID_DEVS --level=$RAID_LEVEL --raid-devices=$stor_disks_num $DISKS
-						mdadm -W $RAID_DEVS
-					fi
-					FILENAMES="filename=$RAID_DEV"
+				if [ "$method" = "rand" ]; then
+					io_depth=$io_ran_depth
 				else 
-					for D in $test_disk_list; do 
-						FILENAMES=$(printf "$FILENAMES\nfilename=$D")
-					done
+					io_depth=$io_seq_depth
+					mode_name=$mode
 				fi
 
-		if [ -n "$MEGA_RAID" ]; then
-			sudo ./MegaCli64 -CfgClr -aAll
-			sudo ./MegaCli64 -CfgSpanAdd r10 Array0[116:49,116:50] Array1[116:51,116:52] Array2[116:53,116:54] Array3[116:55,116:56] Array4[116:57,116:58] Array5[116:59,116:60] -a0
-			sudo ./MegaCli64 -LDInit -Start full -l0 -a0
-		fi
-			
+#		if [ -n "$hard_raid" ]; then
+#			sudo ./MegaCli64 -CfgClr -aAll
+#			# RAID10:
+#			for enc in $(MegaCli64 -PDList -aAll | sed -n 's/Enclosure Device ID: \([0-9]*\)/\1/p' | sort -u); do
+#				n=0
+#				array_devs=
+#				for dev in `seq 1 2 $(($(MegaCli64 -PDList -aAll | grep -C 1 "Enclosure Device ID: $enc" | 
+#					grep 'Slot Number' | cut -d ' ' -f 3 | wc -l)-1))`; do 
+#						dev_pair=$((dev+1))
+#						array_devs="${array_devs}Array$n[$enc:$dev,$enc:$dev_pair] "
+#						n=$((n+1))
+#				done
+#			done
+#			MegaCli64 -CfgSpanAdd $raid_level $array_devs -a0
+#			MegaCli64 -LDInit -Start full -l0 -a0
+#			MegaCli -LDInit ShowProg -l0 -a0
+#		fi
 
+				dev_filenames=''
+
+				if [ -n "$(printf "$device" | sed -n '/^raid/p')" ]; then
+					dev_raid=/dev/md0
+					raid_level="$(printf $device | sed -n 's/^[a-z]*\([0-9]*\)/\1/p')"
+					conf_file="$tmp_dir/${method}_${mode}_${device}.conf"
+					log_file="$tmp_dir/${method}_${mode}_${device}.log"
+
+					if [ "$stor_disks_num" -gt 24 ]; then
+					disks_from=1
+					[ -n "dev_raid_num" ] || dev_raid_num=20
+					dev_raids=''
+						for G in `seq $(($stor_disks_num/$dev_raid_num))`; do
+							dev_raid="/dev/md$(($G-1))"
+							disks_to=$(($G*$dev_raid_num+1))
+							disks_part=$(lsscsi -tg | grep sas | sed -n '$disks_from,$disks_to{s,.*\(/dev/sd[a-z]*\),\1,p}' | tr '\012' ' ')
+							disks_from=$(($disks_to+1));
+							mdadm --create $dev_raid --level=$raid_level --raid-devices=$dev_raid_num "$disks_part"
+							dev_raids="$([ -n "$dev_raids" ] && printf "$dev_raids ")$dev_raid"
+							dev_filenames=$(printf "${dev_filenames:+$dev_filenames\n }filename=$dev_raid")
+						done
+						mdadm -W $dev_raids
+					else
+						dev_raids=$dev_raid
+						mdadm --create $dev_raids --level=$raid_level --raid-devices=$stor_disks_num $disks
+						mdadm -W $dev_raids
+					fi
+					dev_filenames="filename=$dev_raid"
 				cat > "$conf_file" <<EOF
-[$MODE/test]
-$FILENAMES
-rw=$MODE_NAME
+[$mode/test]
+filename=$dev_raid
+rw=$mode_name
 direct=$direct
 buffered=$buffered
 ioengine=$io_engine
-iodepth=$IO_DEPTH
-runtime=$opt_test_duration
+iodepth=$io_depth
+runtime=$test_duration
 EOF
+
+							run_fio_job $conf_file $log_file
+
+				else
+
+					dev_filenames=$(printf "$test_disk_list" | tr '\n' ' ')
+
+						dev_group_count=0
+
+						if [ "$method" = "rand" ]; then
+							dev_group_dim=$dev_group_dim_rand
+						else 
+							dev_group_dim=$dev_group_dim_seq
+						fi
+
+						dev_group_num=$((test_disk_list_num/$dev_group_dim))
+						echo "DEBUG: $dev_group_num"
+						while [ $dev_group_count -lt $dev_group_num ]; do
+							echo "DEBUG: $dev_group_count"
+							dev_group=$(printf $dev_filenames | cut -d ' ' -f $((dev_group_count*$dev_group_dim+1))-$(((dev_group_count+1)*$dev_group_dim)))
+							echo "DEBUG: $dev_group"
+							for dev_disk in $dev_group; do
+								operation_runtime=$sys_test_time
+								if [ $(echo "$stor_disks" | grep -qF "$dev_disk") ]; then
+									[ -n "$opt_test_duration" ] || operation_runtime=$stor_test_time
+								fi
+								conf_file="$tmp_dir/${method}_${mode}_${device}_${dev_disk#/dev/}.conf"
+								log_file="$tmp_dir/${method}_${mode}_${device}_${dev_disk#/dev/}.log"
+								cat > "$conf_file" <<EOF
+[$mode/test]
+filename=$dev_disk
+rw=$mode_name
+direct=$direct
+buffered=$buffered
+ioengine=$io_engine
+iodepth=$io_depth
+runtime=$operation_runtime
+EOF
+							
+									run_fio $conf_file $log_file &
+									printf "$! " >> $jpid_file
+									
+									#[ -n "$VALIDATION" ] && { RESULTS=''; send_results; }
+
+								done
+						done
+						wait $(cat $jpid_file) || rc=$?
+
+			fi
 				
-				i-log log "t:storage: Starting fio test..."
-
-				fio $conf_file  > $log_file || { rc=$?; i-fail "t:storage: Failed to start fio"; }
-
-				check_fio_results || rc=$?
-
-				#[ -n "$VALIDATION" ] && { RESULTS=''; send_results; }
 
 			done
 		done
@@ -407,35 +496,97 @@ EOF
 
 check_fio_results()
 {
-	IOPS=$(cat $log_file | sed -n 's/.*iops=\([0-9]*\).*/\1/p' | sort -r | tail -1)
-	LATENCY_RAW=$(cat $log_file | sed -n 's/.*clat (\([a-z]*\)).*avg=\([0-9]*.[0-9]*\),.*/\2\1/p' | sort -r | head -1)
-	latency_unit="$(printf "$LATENCY_RAW" | sed -ne 's/[0-9]*.[0-9]*\([umsec]*\)/\1/p')"
-  latency_value="$(printf "$LATENCY_RAW" | sed -ne 's/\([0-9]*\).[0-9]*[umsec]*/\1/p')"
+		#log_file="$2"
+		#[ "$mode" = "read" ] && log_part="head -1" || log_part="tail -1"
+		#export $(printf "latency_raw_$mode")=$(cat $log_file | sed -n 's/.*clat (\([a-z]*\)).*avg=\([0-9]*.[0-9]*\),.*/\2\1/p' | $log_part)
+
+		#latency_raw=$(cat $log_file | sed -n 's/.*clat (\([a-z]*\)).*avg=\([0-9]*.[0-9]*\),.*/\2\1/p' | $log_part)
+		latency_read=
+		latency_write=
+
+		latency_raw=$(cat $log_file | sed -n 's/.*clat (\([a-z]*\)).*avg=\([0-9]*.[0-9]*\),.*/\2\1/p' )
+		latency_value=$(printf "$latency_raw" | cut -d '.' -f 1)
+		latency_unit=$(printf "$latency_raw" | tr -d '.[0-9]')
+#		export $(printf "latency_raw_$mode")=$latency_raw
+#		export $(printf "latency_value_$mode")=$latency_value
+#		export $(printf "latency_unit_$mode")=$latency_unit
+
+# latency_raw_read=$(cat $log_file | sed -n 's/.*clat (\([a-z]*\)).*avg=\([0-9]*.[0-9]*\),.*/\2\1/p' | head  -1)
+# latency_unit_read=$(printf $latency_raw_read | tr -d [0-9])
+# latency_value_read=$(printf $latency_raw_read | tr -d [:umsec:] | cut -d '.' -f 1)
+# latency_raw_write=$(cat $log_file | sed -n 's/.*clat (\([a-z]*\)).*avg=\([0-9]*.[0-9]*\),.*/\2\1/p' | tail  -1)
+# latency_unit_write=$(printf $latency_raw_write | tr -d [0-9])
+# latency_value_write=$(printf $latency_raw_write | tr -d [:umsec:] | cut -d '.' -f 1)
+
+#		case "$latency_unit" in
+#				usec) export $(printf "latency_$mode")=$latency_value ;;
+#				msec) export $(printf "latency_$mode")=$((latency_value * 60)) ;;
+#				sec) export $(printf "latency_$mode")=$((latency_value * 3600)) ;;
+#		esac
+
 		case "$latency_unit" in
-				usec) LATENCY="$latency_value" ;;
-				msec) LATENCY="$((latency_value * 60))" ;;
-				sec) LATENCY="$((latency_value * 3600))" ;;
+				usec) export $(printf "latency_$mode")=$latency_value ;;
+				msec) export $(printf "latency_$mode")=$((latency_value * 60)) ;;
+				sec) export $(printf "latency_$mode")=$((latency_value * 3600)) ;;
 		esac
 
-	BANDWIDTH=$(cat $log_file | sed -n 's/.*bw=\([0-9]*\).*/\1/p' | sort -r | tail -1)
-	
-	i-log log "$conf_file: IOPS=$IOPS, latency=$latency_value$latency_unit, bandwidth=$BANDWIDTH KB/s"
+	IOPS=$(cat $log_file | sed -n 's/.*iops=\([0-9]*\).*/\1/p' | head -1)
 
-	[ "$IOPS" -lt "$ref_iops" ] && { rc=2; i-log log "t:storage: Low IOPS on disk operations: $IOPS!" 2>&1 | tee -a $logfile; }
-	[ "$LATENCY" -gt "$ref_latency" ] && { rc=3; i-log log "t:storage: Latency is to high: $LATENCY!" 2>&1 | tee -a $logfile; }
-	[ "$BANDWIDTH" -lt "$ref_bandwidth" ] && { rc=4; i-log log "t:storage: The I/O bandwidth is to low: $BANDWIDTH!" 2>&1 | tee -a $logfile; }
+	bandwidth_raw=$(cat $log_file | sed -n 's/.*bw=\([0-9]*.*\)\/s, iops.*/\1/p' | head -1 )
+	bandwidth_unit="$(printf "$bandwidth_raw" | tr -d [0-9])"
+	bandwidth_value="$(printf "$bandwidth_raw" | tr -d [GMKB] | cut -d '.' -f 1)"
+		case "$bandwidth_unit" in
+				B) bandwidth="$bandwidth_value" ;;
+				KB) bandwidth="$((bandwidth_value * 1024))" ;;
+				MB) bandwidth="$((bandwidth_value * 1048576))" ;;
+				GB) bandwidth="$((bandwidth_value * 1073741824))" ;;
+		esac
+	
+	echo "t:storage: $conf_file, IOPS=$IOPS, ${latency_read:+latency(read)=${latency_raw}, }${latency_write:+latency(write)=$latency_raw, }bandwidth=$bandwidth_raw/s"
+
+	[ -n "$stor_disks" ] && {
+			ref_iops=$ref_iops_all
+			ref_latency_read=$ref_latency_read_all
+			ref_latency_write=$ref_latency_write_all
+			ref_bandwidth=$ref_bandwidth_all
+		} || {
+			ref_iops=$ref_iops_sys
+			ref_latency_read=$ref_latency_read_sys
+			ref_latency_write=$ref_latency_write_sys
+			ref_bandwidth=$ref_bandwidth_sys
+		}
+
+			[ "$IOPS" -lt "$ref_iops" ] && {
+				rc=2; echo "t:storage: Low IOPS on disk operations: $IOPS!" 2>&1 | tee -a $logfile
+			}
+
+			[ -z $latency_read ] || {
+				[ "$latency_read" -gt "$ref_latency_read" ] && {
+					rc=3; echo "t:storage: Latency(read) is to high: $latency_raw_read!" 2>&1 | tee -a $logfile
+				}
+			}
+
+			[ -z $latency_write ] || {
+				[ "$latency_write" -gt "$ref_latency_write" ] && {
+					rc=3; echo "t:storage: Latency(write) is to high: $latency_raw_write!" 2>&1 | tee -a $logfile
+				}
+			}
+
+			[ "$bandwidth" -lt "$ref_bandwidth" ] && {
+				rc=4; echo "t:storage: The I/O bandwidth is to low: $bandwidth!" 2>&1 | tee -a $logfile
+			}
 	return $rc
 }
 
 run_badblocks()
 {
-	timeout -k 5 $opt_test_duration badblocks -wv -b 512 -e 3 -s -t 0xff -o $(printf "$bad_block_list"."$$") $d 2>&1 || rc=$?
+	timeout -k 5 $opt_test_duration badblocks -wv -b 512 -e 3 -s -t 0xff -o $(printf "$bad_block_list"."$$" | tee -a $bad_disks_list) $d 2>&1 || rc=$?
 	bpid=$!
 	printf "$bpid " >> $fpid_file
 	wait $bpid || rc=$?
 		# RC: 127 for timeout and 1? for pass
 		if [ "$rc" -ne 0 -a "$rc" -ne 127 ]; then
-				i-log log "badblocks ended with RC: $rc"
+				echo "badblocks ended with RC: $rc"
 				light_up_slot failed $d
 		fi  
 #	[ -n "$send_results" ] && curl -v -g -d "STAGE=2&RESULT=FAILED&REASON=BBLOCK_FAILED&$data" "$api_url"
@@ -452,7 +603,7 @@ run_badblocks_check()
 	done
 
 	sleep $((opt_test_duration+5))
-	[ ! -n "$(cat $bad_block_list''* ||:)" ] || i-log log "t:storage: disks has bad blocks: $(cat $bad_block_list''* ||:)" | tee -a $logfile
+	[ ! -n "$(cat $bad_block_list''* ||:)" ] || echo "t:storage: disks has bad blocks: $(cat $bad_block_list''* ||:)" | tee -a $logfile
 
 	kill -9 $(cat $ipid_file) $(cat $tpid_file) >/dev/null 2>&1 ||:
 	return $rc 
@@ -461,9 +612,9 @@ run_badblocks_check()
 hdd_temp_measurement()
 {
 	cur_hdd_temp=$(smartctl -a $1 | grep Temperature_Celsius | awk '{print $10}');
-	[ "$cur_hdd_temp" -ge "$warn_hdd_temp" ] && i-log log "$1(S/N:$(smartctl -a $1 | sed -ne 's/^Serial Number: *\(.*\)/\1/p'), $(get_slot) ) temperature is high: $cur_hdd_temp°C"
+	[ "$cur_hdd_temp" -ge "$warn_hdd_temp" ] && echo "$1(S/N:$(smartctl -a $1 | sed -ne 's/^Serial Number: *\(.*\)/\1/p'), $(get_slot) ) temperature is high: $cur_hdd_temp°C"
 	[ "$cur_hdd_temp" -ge "$max_hdd_temp" ] && \
-	{ kill -9  $(cat $ipid_file) $(cat $fpid_file) >/dev/null 2>&1 || rc=$?; i-status 1 "$1(S/N:$(smartctl -a $1 | sed -ne 's/^Serial Number: *\(.*\)/\1/p'), $(get_slot) ) temperature is CRITICAL: $cur_hdd_temp°C"; exit $rc; }
+	{ kill -9  $(cat $ipid_file) $(cat $fpid_file) >/dev/null 2>&1 || rc=$?; echo "$1(S/N:$(smartctl -a $1 | sed -ne 's/^Serial Number: *\(.*\)/\1/p'), $(get_slot) ) temperature is CRITICAL: $cur_hdd_temp°C"; exit $rc; }
 }
 
 hdd_temp_check()
@@ -477,20 +628,22 @@ hdd_temp_check()
 	done
 }
 
+echo "t:storage: VERSION $VERSION"
+
 [ -n "$expanders" ] && check_storage_disks_num
 
 check_log &
 ipid=$!
 printf "$ipid" > $ipid_file
 
-#hdd_temp_check &
-#tpid=$!
-#printf "$tpid" > $tpid_file
+hdd_temp_check &
+tpid=$!
+printf "$tpid" > $tpid_file
 
 for test in $opt_tests; do
 	rc=0
 	echo $test > /var/run/current-load
-	i-log log "t:storage: $test test started"
+	echo "t:storage: Starting $test test..."
 	case $test in
 		fio)
 			run_fio &
@@ -508,17 +661,10 @@ done
 
 wait "$ipid" "$fpid" ||:
 
-check_smart ||:
+[ ! -s "$logfile" -a ! -s "${bad_block_list}*" ] || 
+	echo "t:storage: FAILED! $(cat $logfile | cut -d ' ' -f 3- | uniq | tr '\n' '; ';
+		[ ! -s "$bad_disks_list" ] || for list in $(cat $bad_disks_list); do \
+			[ -s "$list" ] && cat $list | cut -d ' ' -f 3- | tr '\n' '; ' ||: 
+		done)"
 
-#cutout="| cut -d ' ' -f 3- | tr '\\n' ';' >/dev/null 2>&1 ||:"
-#[ ! -s "$logfile" -a ! -s "$bad_block_list" -a ! -s "$bad_smart_list" ] || \
-#	i-status 1 "Storage test failed: $(cat $logfile $cutout ; \
-#		cat $bad_block_list $cutout ; \
-#		cat $bad_smart_list $cutout)"
-
-[ ! -s "$logfile" -a ! -s "$bad_block_list" -a ! -s "$bad_smart_list" ] || \
-	i-status 1 "Storage test failed: $(cat $logfile | cut -d ' ' -f 3- | tr '\n' '; ' 2>/dev/null ||: ;\
-		cat $bad_block_list | cut -d ' ' -f 3- | tr '\n' '; ' 2>/dev/null ||: ;\
-		cat $bad_smart_list | cut -d ' ' -f 3- | tr '\n' '; ' 2>/dev/null ||: )"
-
-i-complete #"t:storage: Check successfully completed"
+exit
