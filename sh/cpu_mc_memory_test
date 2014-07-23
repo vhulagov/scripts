@@ -1,16 +1,18 @@
 #!/bin/sh -e
+VERSION=0.6
 
 [ -n "$SERVER" -a -n "$MAC" ]
 
-g-unpack-cpio t:mem
-g-unpack-cpio perl
+cd /
+cat t:mem | lzma -c -d | cpio -iumd
+cat perl | lzma -c -d | cpio -iumd
 
 modprobe msr ||:
 modprobe sb_edac
 
 SAVED_TRAPS="$(trap)"
 
-mem_sigstop()
+load_sigstop()
 {
     rc="$?"
 
@@ -18,14 +20,14 @@ mem_sigstop()
     [ -z "$TPID" ] || kill -9 "$TPID" 2>/dev/null ||:
     [ -z "$EPID" ] || kill -9 "$EPID" 2>/dev/null ||:
 
-    killall xlinpack_xeon64 2>/dev/null ||:
-    killall stressapptest 2>/dev/null ||:
-    killall fio 2>/dev/null ||:
-    killall ptumon 2>/dev/null ||:
-    killall ptugen 2>/dev/null ||:
-    killall inotifywait 2>/dev/null ||:
+    killall -9 xlinpack_xeon64 2>/dev/null ||:
+    killall -9 stressapptest 2>/dev/null ||:
+    killall -9 ptumon 2>/dev/null ||:
+    killall -9 ptugen 2>/dev/null ||:
+    killall -9 tail 2>/dev/null ||:
 
-    rm -f $lpid_file $tpid_file $rpid_file $epid_file $fifo_file ||:
+		kill -9 $(cat $lpid_file) $(cat $tpid_file) $(cat $epid_file) 2>/dev/null ||:
+    rm -f $lpid_file $tpid_file $epid_file $fifo_file /var/run/current-load /tmp/skip_err_flag ||:
 
     eval "$SAVED_TRAPS"
 
@@ -34,37 +36,39 @@ mem_sigstop()
     set +x
 }
 
-trap mem_sigstop USR1 KILL TERM EXIT QUIT INT
+trap load_sigstop USR1 KILL TERM EXIT QUIT INT
 
-logfile=/var/log/edac.$$.log
+logfile=/var/log/t\:load$$.log
+
 lpid_file=/var/run/load.pid
 tpid_file=/var/run/temp-check.pid
-rpid_file=/var/run/result-check.pid
 epid_file=/var/run/dmesg-check.pid
-fpid_file=/var/run/fio-load.pid
 
 config_file=/tmp/xlinpack.$$.config
 fifo_file=/tmp/xlinpack.$$.pipe
+skip_checks=/tmp/skip_checks.cnt
 
-TEMP=`getopt -o a:g:m:n:s:t:l:fd --long apply-test:,max-temp:,num-of-tests:,gflops:,matrix-size:,test-duration:,latency:,allow-throttling,debug-mode -- "$@" || i-fail "t:mem: wrong parameters"`
+TEMP=`getopt -o a:p:g:m:n:s:S:t:w:fd --long apply-test:,test-params:,max-temp:,num-of-tests:,gflops:,matrix-size:,skip-errors:,test-duration:,wait-time:,allow-throttling,debug-mode -- "$@" || echo  "t:load: wrong parameters"`
 
 eval set -- "$TEMP"
 
 opt_tests=
 opt_gflops=0
-opt_latency=5
+opt_wait_time=300
 opt_maxtemp=85
 opt_num_of_tests=1
-opt_test_duration=300
+opt_test_duration=3600
 
 while :; do
     case "$1" in
     -a|--apply-test) shift
         case "$1" in
         linpack|stressapptest|ptugen) opt_tests="${opt_tests:+$opt_tests,}$1" ;;
-				fio) opt_fio=1 ;;
-        *) i-fail "t:memory: unknown test: $1" ;;
+        *) echo  "t:load: unknown test: $1" ;;
         esac
+        ;;
+    -p|--test-params) shift
+        opt_test_params="$1"
         ;;
     -m|--max-temp) shift
         opt_maxtemp="$1"
@@ -74,6 +78,9 @@ while :; do
         ;;
     -s|--matrix-size) shift
         opt_matrix_size="$1"
+        ;;
+    -S|--skip-errors) shift
+        opt_skip_errors="$1"
         ;;
     -g|--gflops) shift
         opt_gflops="$1"
@@ -88,8 +95,8 @@ while :; do
             h) opt_test_duration="$((value * 3600))" ;;
         esac
         ;;
-    -l|--latency) shift
-        opt_latency="$1"
+    -w|--wait-time) shift
+        opt_wait_time="$1"
         ;;
     -f|--allow-throttling)
         opt_allow_throttling=1
@@ -100,7 +107,7 @@ while :; do
     --) shift
         break
         ;;
-    *) i-fail "t:memory: wrong option: $1"
+    *) echo  "t:load: wrong option: $1"
         ;;
     esac
     shift
@@ -111,24 +118,14 @@ opt_tests="$(echo $opt_tests | tr ',' ' ')"
 
 linpack_check()
 {
-		awk -vgflops="$opt_gflops" -vlogf="$logfile" '
-(NR == 1) && (!/LINPACK/) { exit 3 }
-/Performance Summary/ { l=NR+2; nl=NR+3 }
-(NR == l) {
-    for (f=1; f <= NF; f++)
-        if ($f == "Average") c = f
-}
-(NR == nl) {
-    if ($c !~ /^[[:digit:]]*\.[[:digit:]]*$/) { print "Wrong output", $0 >> logf; exit 2 }
-    if ($c < gflops) { print "CPU perfomance problem:", $c >> logf; exit 1}
-}' "$fifo_file"
-}
-
-fio_load()
-{
-	cp /usr/share/einstellung/stages/t\:storage /usr/share/einstellung/stages/t\:storage-standalone
-	sed -i 's/i-fail/echo /g;s/i-status [0-9]/echo/g;s/i-complete/exit/g' /usr/share/einstellung/stages/t\:storage-standalone
-	timeout -k 10 $((opt_test_duration+10)) sh /usr/share/einstellung/stages/t\:storage-standalone -D disk -M random -m readwrite -d 256 -t $((opt_test_duration-10))
+# TODO Determine Performance flag
+#tag list | grep performance
+tail -f "$fifo_file" | while read line; do
+	# TODO Do more strict GFLOPS matching
+	#gflops=$(printf "$line" | sed 's/ *[0-9]*   [0-9]*   [0-9] * \([0-9]*.[0-9]*\) *.*/\1/p')
+	gflops=$(printf "$line" | grep "$opt_matrix_size" | cut -d' ' -f14)
+	[ -z "$gflops" ] || { tag +performance_${flops}_GFLOPS; echo "t:load: Measured performance is $gflops GFLOPS"; return 0; }
+done
 }
 
 load_start()
@@ -137,41 +134,51 @@ load_start()
     for test in $opt_tests; do
         rc=0
         echo $test > /var/run/current-load
-        i-log log "t:load: $test test started"
         case $test in
         linpack)
-            timeout -k 5 $opt_test_duration xlinpack_xeon64 "$config_file" 1>$fifo_file 2>&1 &
+            timeout -k 5 $((opt_test_duration+30)) xlinpack_xeon64 "$config_file" 1>$fifo_file 2>&1 &
             pid=$!
-            echo $pid > /var/run/linpack.pid
             linpack_check &
-            pid="$pid $!"
+            #pid="$pid $!"
+            printf " $!" >> $lpid_file
+						i-log log "t:load: $test test started"
+            #echo $pid > /var/run/load-linpack.pid
+            printf " $pid" >> $lpid_file
             ;;
         stressapptest)
-            timeout -k 10 $((opt_test_duration+30)) stressapptest -v 10 -A -s $opt_test_duration &
+						[ -n $opt_test_params ] && opt_test_params='-A -v 10'
+            timeout -k 10 $((opt_test_duration+30)) stressapptest $opt_test_params -s $opt_test_duration &
             pid=$!
-            echo $pid > /var/run/stresapptest.pid
+            #echo $pid > /var/run/load-stresapptest.pid
+            printf " $pid" >> $lpid_file
             ;;
         ptugen)
             touch /root/.accepted_intel_ptu_license
-            timeout -k 5 $((opt_test_duration+5)) ptugen -t $opt_test_duration -ct 4 -mt 3 -p 100 &
+						[ -n $opt_test_params ] && opt_test_params='-ct 4 -mt 3'
+            timeout -k 5 $((opt_test_duration+5)) ptugen -t $opt_test_duration $opt_test_params -l y &
             pid=$!
-            echo $pid > /var/run/ptugen.pid
+            #echo $pid > /var/run/load-ptugen.pid
+            printf " $pid" >> $lpid_file
             ;;
         esac
 	
         wait $pid || rc=$?
-        rm -f /var/run/linpack.pid
+        #rm -f /var/run/load-* ||:
+				i-log log "t:load: $test test ended"
         # RC: 124 for timeout and 137 for stressapptest pass
-        [ "$rc" -ne 137 ] || i-log log "$test: RC is 137"
+        [ "$rc" -ne 137 ] || i-log log "t:load: $test RC is 137"
         if [ "$rc" -ne 0 -a "$rc" -ne 124 -a "$rc" -ne 137 ]; then
+						if [ "$rc" -eq 255 ]; then
+							echo "t:load: Not enought memory to run $test (rc:$rc)" >> $logfile
+						fi
             echo "$test ended with $rc" >> $logfile
             break
         fi
     done
 
+		i-log log "t:load: killing subprocesses..."
     kill -9 $(cat $tpid_file 2>/dev/null) \
-						$(cat $fpid_file 2>/dev/null) \
-            $(cat $epid_file 2>/dev/null) ||:
+            $(cat $epid_file 2>/dev/null) 2>/dev/null ||:
     exit $rc
 }
 
@@ -190,14 +197,19 @@ cpu_temp_check()
         if (v !~ /^[[:space:]]*[[:digit:]]+\.[[:digit:]]+[[:space:]]*$/) { print "Wrong sensor value:", v >> logf; exit 2 }
         v=int(v)
         if (v >= temp) { print $1, "is HIGH:", v >> logf; exit 1 }
-    }' || { ec=$?; [ -z "$opt_allow_throttling" ] || { sleep 10;
-						if ! tag CPU_overheated?; then 
-							tag +CPU_overheated
-							i-log setup "CPU temp is HIGH!";
-						fi
-						ec=0; continue; } ;
-						kill -9 $(cat $lpid_file 2>/dev/null) $(cat $fpid_file 2>/dev/null) $(cat $epid_file 2>/dev/null) ||:;
-						exit $ec; }
+    }' || { rc=$?; [ -z "$opt_allow_throttling" ] || {
+							sleep 10
+							if ! tag CPU_overheated?; then 
+								tag +CPU_overheated
+								i-log setup "CPU temp is HIGH!"
+							fi
+							rc=0
+							continue
+						}
+						kill -9 $(cat $lpid_file 2>/dev/null) \
+										$(cat $epid_file 2>/dev/null) 2>/dev/null ||:
+						exit $rc
+					}
         sleep 1
     done
 }
@@ -205,65 +217,115 @@ cpu_temp_check()
 
 log_check()
 {
+	if printf "$1" | grep -q "GHES.*disabled"; then
+			if ! tag GHES_disabled?; then
+				tag +GHES_disabled
+				#sed -i '/GHES.*disabled/d' $message
+				echo "Warning: GHES disabled">> $logfile
+			fi
+			return 0
+	elif printf "$1" | grep -qE "EDAC.*error"; then
+			i-log log "t:load: EDAC error catched"
+			if [ -n "$failure_dimms" ]; then
+				failure_dimm="$(edac-util | grep -E -v "$failure_dimms" | sed -ne 's/.*:.*:[ ]\(.*\):.*/\1/p;s/\n/,/;')"
+			else
+				failure_dimm="$(edac-util | sed -ne 's/.*:.*:[ ]\(.*\):.*/\1/p;s/\n/,/;')"
+			fi
+				
+			failure_dimms="$([ -n $failure_dimm ] && printf "${failure_dimms:+|}$failure_dimm")"
+			echo "Found errors in module(s): $failure_dimms" >> $logfile
+			sleep $opt_wait_time
+			break
+	elif printf "$1" | grep -iF "Hardware Error"; then
+			# TODO Parse mcelog output for errors and egrep with system log messages	\
+			i-log log "t:load: HW errors handler triggered"
+			# TODO Count times of triggering HW errors handler
+			
+			[ -z "$opt_skip_errors" ] || {
+			i-log log "t:load: Skip HW Errors option is enabled"
+				[ -z "$(printf "$1" | grep -F "$2")" ] || {
+					touch /tmp/skip_err_flag && i-log log "t:load: start skipping HW errors from message: $2"
+					#touch /tmp/skip_err_flag && i-log log "t:load: Skipping HW Errors from message: $(printf "$2" | grep -v '^[[:space:]]*$')"
+					tag +HW_errs_skipped
+				}
+				[ -z "$(printf "$1" | grep -F "$3")" ] || {
+					rm /tmp/skip_err_flag && i-log log "t:load: stop skipping HW errors due to recieved message: $3"
+					#rm /tmp/skip_err_flag && i-log log "t:load: Stop skipping HW Errors due to recieved message: $(printf "$3" | grep -v '^[[:space:]]*$')"
+					tag -HW_errs_skipped
+					return 0
+				}
+				[ -e /tmp/skip_err_flag ] && { i-log log "t:load: Skip HW Error: $(printf "$1" | grep -v '^[[:space:]]*$')"; return 0; }
+			}
+
+			[ -z "$opt_allow_throttling" ] || return 0
+
+			cat /var/log/messages | grep -F "$3" -B 10  >> $logfile
+
+	elif printf "$1" | grep -qF throttled; then
+			warn_message="CPU has been throttled"
+			if [ -n "$opt_allow_throttling" ]; then
+				if ! tag CPU_throttled?; then
+					echo "Warning: $warn_message" >> $logfile
+					tag +CPU_throttled
+#								echo "CPU is throttled"
+				fi
+				return 0
+			fi
+	elif $(printf "$1" | grep -qF "perf samples too long"); then
+			nmi_cpu_time=$(printf $1 | sed -n 's/.*perf samples too long (\([0-9]*\) .*/\1/p' | tr -d '\n')
+			echo "Warning: NMI handler takes too much CPU time${nmi_cpu_time:+ $nmi_cpu_time ns}" >> $logfile
+			nmi_counter=$((nmi_counter+1))
+			if [ "$nmi_counter" -gt 2 ]; then
+				if ! tag NMI_hangs?; then 
+					tag +NMI_hangs
+				fi
+				export opt_test_duration=$((opt_test_duration+14400)); 
+				i-log log "t:load: [$(cat /var/run/current-load)] Hardware failure detected. \
+						Test duration increased by 4 hours.";
+			fi
+	 return 0
+	else
+	 return 0
+	fi
+
+	kill -9 $(cat $epid_file 2>/dev/null) \
+						$(cat $lpid_file 2>/dev/null) \
+            $(cat $tpid_file 2>/dev/null) 2>/dev/null ||:
+	return 1
+}
+
+
+log_catcher()
+{
 		tag -CPU_throttled
 		tag -GHES_disabled
 		tag -NMI_hangs
+		tag -HW_errs_skipped
 		
-		dimm_err=
+		failure_dimms=
+		nmi_counter=
 		#sed -i '$d' /bin/i\-status
-    inotifywait -q -m -e modify /var/log/messages | while read foo; do
-        if egrep -q "EDAC.*error" /var/log/messages; then
-            sleep "$opt_latency"
+		[ -z "$opt_skip_errors" ] || {
+			skip_err_from=$(printf "$opt_skip_errors" | cut -d '?' -f 1)
+			skip_err_to=$(printf "$opt_skip_errors" | cut -d '?' -f 2)
+		}
 
-						dimm_err="$dimm_err$([ -n "$dimm_err" ] && printf "|")\
-								$(edac-util | grep -E -v "($dimm_err)" | sed -ne 's/.*:.*:[ ]\(.*\):.*/\1/p;s/\n/,/;')"
-            echo "Found errors in module(s): $dimm_err" >> $logfile
-						# TODO Rename dimm_err to failure_dimms and agregate errs to this variable. \
-						# Check source of any new error and compare it from previous sources
-        elif fgrep -qi -m1 "Hardware Error" /var/log/messages; then
-            sleep "$opt_latency"
-						# TODO Parse mcelog output for errors and egrep with system log messages	\
-						# Test truthfulness of `mcelog --dmi` output.
-            fgrep -i 'Hardware Error' /var/log/messages | cut -d ']' -f2- | sort -u | head -n 5 >> $logfile
-						[ -z "$opt_allow_throttling" ] || continue
-
-        elif fgrep -q -m1 throttled /var/log/messages; then
-						warn_message="CPU has been throttled"
-						if [ -n "$opt_allow_throttling" ]; then
-							if ! tag CPU_throttled?; then
-								echo "Warning: $warn_message" >> $logfile
-								tag +CPU_throttled
-#								i-status 2 "CPU is throttled"
-								sed -i '/throttled/d' /var/log/messages
-							fi
-							continue
-						fi
-				elif fgrep -q -m1 "perf samples too long" /var/log/messages; then
-						if ! tag NMI_hangs?; then 
-							tag +NMI_hangs
-							echo "Warning: NMI handler takes too much CPU time $(cat /var/log/messages | sed -n 's/.*perf samples too long (\([0-9]*\) .*/\1/p')ns" >> $logfile
-							sed -i '/perf samples too long/d' /var/log/messages
-						fi
-						continue
-				elif egrep -q "GHES.*disabled" /var/log/messages; then
-						if ! tag GHES_disabled?; then
-							tag +GHES_disabled
-							sed -i '/GHES.*disabled/d' /var/log/messages
-							echo "Warning: GHES disabled">> $logfile
-						fi
-						continue
-        else
-            continue
-        fi
-
-        kill -9 $LPID $TPID $FPID 2>/dev/null ||:
-        return 1
+    tail -f -n 0 /var/log/messages | while read month day time process message; do
+			log_check "$message" "$skip_err_from" "$skip_err_to" "$month $day $time $process" &
+			printf " $!" >> $epid_file
+		#TODO clean $(sed) old log_checks every 10 sec from $epid_file
     done
 }
 
 cpumodel=$(fgrep model\ name /proc/cpuinfo |head -1|cut -f 2 -d ':')
 case "$cpumodel" in
-*E5-2660*|*E5-2690*|*E5-2667*)
+*E5-2660*)
+    opt_gflops=240
+    ;;
+*E5-2690*)
+    opt_gflops=240
+    ;;
+*E5-2667*)
     opt_gflops=240
     ;;
 *)
@@ -271,7 +333,7 @@ case "$cpumodel" in
 esac
 
 ! edac-ctl --register-labels 2>&1 | fgrep -q "No dimm" ||
-    i-log log 'Warning! A possibility to find a slot with defective DIMM is not supported for this MB.'
+    i-log log 't:load: Warning! A possibility to find a slot with defective DIMM is not supported for this MB.'
 
 cpunumber=$(cat /proc/cpuinfo | grep "physical id" | sort -u | wc -l)
 coresnumber=$(cat /proc/cpuinfo | grep "^cpu cores"| head -1 |cut -d ':' -f 2|tr -d ' ')
@@ -283,7 +345,7 @@ export OMP_DYNAMIC=false
 #[ -n "$opt_matrix_size" ] || opt_matrix_size="$(grep -w MemTotal: /proc/meminfo|awk -vsz=0 '{ print int(sqrt(( $2 - 524288 ) * 0.90 * 1024 / 8 )) }')"
 [ -n "$opt_matrix_size" ] || opt_matrix_size="$(perl -ne 's/^MemTotal: *(\d+)// && print int(sqrt( ($1 - 524288 ) * 0.9 * 1024 / 8 )) ' /proc/meminfo)"
 
-cat <<EOF>$config_file
+cat <<EOF> $config_file
 Sample Intel(R) Optimized LINPACK Benchmark data file (lininput_xeon64)
 Intel(R) Optimized LINPACK Benchmark data
 1 # number of tests
@@ -296,36 +358,40 @@ EOF
 rm -f $fifo_file $logfile
 mkfifo $fifo_file
 
+i-log log "t:load: VERSION $VERSION"
+
 _start="$(date +%s)"
+
+stage_attempt="$(i-get einstellung/show_stages | sed -n 's/.* *\([0-9]\) *t:load.*/\1/p' | tail -1)"
+[ "$stage_attempt" -gt 1 ] && { 
+	echo  "t:load: Server reboots during last workload!"
+}
+
 load_start &
 LPID=$!
-echo $LPID > $lpid_file
+printf $LPID > $lpid_file
 
 cpu_temp_check &
 TPID=$!
-echo $TPID > $tpid_file
+printf $TPID > $tpid_file
 
-log_check &
+log_catcher &
 EPID=$!
-echo $EPID > $epid_file
-
-[ -z "$opt_fio" ] || fio_load &
-FPID=$!
-echo $FPID > $fpid_file
+printf $EPID > $epid_file
 
 wait "$LPID" "$TPID" "$EPID" ||:
 
 i-log log "`mcelog`" ||:
+i-log log "`mcelog --dmi`" ||:
 
 [ ! -s "$logfile" ] || { warn_messages=$(cat $logfile | sort -u | sed -n 's/^Warning: //p'); 
 	[ -n "$warn_messages" ] && { i-log log "Warnings: $warn_messages; $(grep -E '^Warning' $logfile | wc -l) entries total."; 
 		sed -in '/^Warning: /d' $logfile; };
 }
 
-[ ! -s "$logfile" ] || i-status 1 "Load test failed$( [ -z  "$opt_allow_throttling" ] && { printf ": "; cat $logfile | sort -u; } ). Please check the log."
+[ ! -s "$logfile" ] || echo "t:load: FAILED! $(cat $logfile | uniq | grep -vE '^Warning')"
 
 _finish="$(date +%s)"
 duration="$(((_finish-_start)/60))"
 
-
-i-complete
+exit
