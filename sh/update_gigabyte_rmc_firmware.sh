@@ -232,7 +232,7 @@ reboot_rmcs()
 }
 
 for FQDN in $rmcs_list; do
-		rmc_a="$FQDN.ipmi.yandex-team.ru"
+		rmc_a="$FQDN.ipmi.ru"
 		if ping6 -q -c 1 $rmc_a 2>&1 > /dev/null ; then
 			ssh="timeout 60 sshpass -p $rmc_user_pass ssh -n -o ConnectTimeout=60 -o StrictHostKeyChecking=no -l rmc"
 			#rsync="sshpass -p $rmc_user_pass rsync -avP -e \"ssh -o StrictHostKeyChecking=no\""

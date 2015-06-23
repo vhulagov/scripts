@@ -1,6 +1,6 @@
 #!/bin/sh -e
 
-API="http://ya-hw-cert.yandex-team.ru/cgi-bin/hirt.pl"
+API="****/cgi-bin/hirt.pl"
 
 ACTIVE_NIC=eth0
 
