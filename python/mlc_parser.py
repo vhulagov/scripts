@@ -3,11 +3,10 @@
 from __future__ import print_function
 
 import os
-from time
+from time import time
 import argparse
 
 from socket import socket, AF_INET6, SOCK_STREAM
-import httplib
 import json
 
 import midecode
@@ -44,6 +43,7 @@ def get_dimm_part_number():
             return dimm['part number'].replace('.','_')
 
 def get_inventory_number(server, mac):
+    import httplib
     conn = httplib.HTTPConnection(server)
     conn.request("GET","/computer/list.cli?f="+str(mac))
     response = conn.getresponse()
@@ -63,7 +63,8 @@ def send_graphite_metric(metric, timestamp=None):
 
     sock = socket(AF_INET6, SOCK_STREAM)
     sock.connect((CARBON_SERVER, CARBON_PORT))
-    sock.sendall(message)
+    from dmp_suite.string_utils import to_bytes
+    sock.sendall(to_bytes(message))
     sock.close()
 
 def process_idle_latencies(res_block, idle_latencies, idle_latencies_fullset):
